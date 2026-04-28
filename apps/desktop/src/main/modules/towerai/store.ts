@@ -21,10 +21,15 @@ class TowerAIStore {
 
   set(state: TowerAITokenState): void {
     this.state = { ...state, lastRefreshAt: new Date().toISOString() };
+    // Sync to process.env so the Next.js server (same process) can read them
+    process.env.TOWERAI_API_KEY = state.token;
+    process.env.TOWERAI_AUTH_TOKEN = state.authToken;
   }
 
   clear(): void {
     this.state = { authToken: '', token: '' };
+    delete process.env.TOWERAI_API_KEY;
+    delete process.env.TOWERAI_AUTH_TOKEN;
   }
 
   getAuthState(): TowerAIAuthState {

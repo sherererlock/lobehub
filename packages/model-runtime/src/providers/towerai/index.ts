@@ -17,6 +17,29 @@ export function resolveTowerAIEndpoint(baseUrl: string, model: string): string {
   return `${base}/zi/webapi/chat/openai`;
 }
 
+interface TowerAITokens {
+  authToken: string;
+  token: string;
+}
+
+async function fetchTokensViaHelper(helperUrl: string): Promise<TowerAITokens> {
+  const res = await fetch(`${helperUrl.replace(/\/$/, '')}/auth/token`);
+  if (!res.ok) throw new Error(`TowerAI helper returned ${res.status}`);
+  const body = (await res.json()) as { data?: { authToken?: unknown; token?: unknown } };
+  return {
+    authToken: typeof body.data?.authToken === 'string' ? body.data.authToken.trim() : '',
+    token: typeof body.data?.token === 'string' ? body.data.token.trim() : '',
+  };
+}
+
+async function refreshTokenViaHelper(helperUrl: string): Promise<void> {
+  await fetch(`${helperUrl.replace(/\/$/, '')}/auth/refresh`, { method: 'POST' });
+}
+
+function isTowerAITokenExpired(text: string): boolean {
+  return text.includes('600015') || text.includes('token过期');
+}
+
 // Convert Tower AI SSE (event: text/stop) → OpenAI SSE (data: {...})
 function toOpenAIStream(
   src: ReadableStream<Uint8Array>,
@@ -109,9 +132,20 @@ export const params = {
   },
   customClient: {
     createClient: (options) => {
-      const token = process.env.TOWERAI_API_KEY || options.apiKey || '';
-      const authToken = process.env.TOWERAI_AUTH_TOKEN || '';
+      const staticToken = process.env.TOWERAI_API_KEY || options.apiKey || '';
+      const staticAuthToken = process.env.TOWERAI_AUTH_TOKEN || '';
+      const helperUrl = process.env.TOWERAI_HELPER_URL || '';
       const debug = process.env.DEBUG_TOWERAI_CHAT_COMPLETION === '1';
+
+      const buildHeaders = (t: string, at: string, streaming: boolean): Record<string, string> => {
+        const h: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Token': t,
+          'accept': streaming ? 'text/event-stream' : 'application/json',
+        };
+        if (at) h['X-lobe-chat-auth'] = at;
+        return h;
+      };
 
       const customFetch: typeof fetch = async (input, init) => {
         const url =
@@ -128,28 +162,55 @@ export const params = {
         const isStreaming = (body?.stream as boolean) ?? false;
         const endpoint = resolveTowerAIEndpoint(TOWERAI_DEFAULT_BASE_URL, model);
 
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-          'accept': isStreaming ? 'text/event-stream' : 'application/json',
-          'Token': token,
-        };
-        if (authToken) headers['X-lobe-chat-auth'] = authToken;
+        // Resolve tokens: helper URL > static env vars
+        let resolvedToken = staticToken;
+        let resolvedAuthToken = staticAuthToken;
+        if (helperUrl) {
+          try {
+            const t = await fetchTokensViaHelper(helperUrl);
+            if (t.token) {
+              resolvedToken = t.token;
+              resolvedAuthToken = t.authToken;
+            }
+          } catch (err) {
+            if (debug) console.warn('[TowerAI] helper unavailable, using static token:', err);
+          }
+        }
 
         if (debug) {
           console.info('[TowerAI] → POST', endpoint, 'model:', model);
-          console.info(
-            '[TowerAI]   Token:',
-            token.slice(0, 12),
-            '...  X-lobe-chat-auth:',
-            authToken ? authToken.slice(0, 12) + '...' : '(none)',
-          );
         }
 
-        const res = await fetch(endpoint, { method: 'POST', headers, body: init?.body as string });
+        let res = await fetch(endpoint, {
+          method: 'POST',
+          headers: buildHeaders(resolvedToken, resolvedAuthToken, isStreaming),
+          body: init?.body as string,
+        });
+
+        // Auto-refresh on token expiry (error code 600015 / "token过期")
+        if (!res.ok && helperUrl) {
+          const errText = await res.clone().text();
+          if (isTowerAITokenExpired(errText)) {
+            if (debug) console.info('[TowerAI] token expired, refreshing via helper...');
+            try {
+              await refreshTokenViaHelper(helperUrl);
+              const refreshed = await fetchTokensViaHelper(helperUrl);
+              resolvedToken = refreshed.token || resolvedToken;
+              resolvedAuthToken = refreshed.authToken || resolvedAuthToken;
+              res = await fetch(endpoint, {
+                method: 'POST',
+                headers: buildHeaders(resolvedToken, resolvedAuthToken, isStreaming),
+                body: init?.body as string,
+              });
+            } catch (err) {
+              if (debug) console.warn('[TowerAI] token refresh failed:', err);
+            }
+          }
+        }
 
         if (debug) {
           const preview = await res.clone().text();
-          console.info('[TowerAI] ←', res.status, res.headers.get('content-type'));
+          console.info('[TowerAI] ← status:', res.status, res.headers.get('content-type'));
           console.info('[TowerAI]  ', preview.slice(0, 300));
         }
 
@@ -168,7 +229,7 @@ export const params = {
 
       return new OpenAI({
         ...options,
-        apiKey: token || 'tower-ai',
+        apiKey: staticToken || 'tower-ai',
         baseURL: `${TOWERAI_DEFAULT_BASE_URL}/zi/webapi/chat/openai`,
         defaultHeaders: {},
         fetch: customFetch,

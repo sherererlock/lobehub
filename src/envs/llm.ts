@@ -11,6 +11,7 @@ export const getLLMConfig = () => {
 
       TOWERAI_API_KEY: z.string().optional(),
       TOWERAI_AUTH_TOKEN: z.string().optional(),
+      TOWERAI_HELPER_URL: z.string().optional(),
 
       ENABLED_AZURE_OPENAI: z.boolean(),
       AZURE_API_KEY: z.string().optional(),
@@ -263,6 +264,7 @@ export const getLLMConfig = () => {
 
       TOWERAI_API_KEY: process.env.TOWERAI_API_KEY,
       TOWERAI_AUTH_TOKEN: process.env.TOWERAI_AUTH_TOKEN,
+      TOWERAI_HELPER_URL: process.env.TOWERAI_HELPER_URL,
 
       ENABLED_AZURE_OPENAI: !!process.env.AZURE_API_KEY,
       AZURE_API_KEY: process.env.AZURE_API_KEY,
