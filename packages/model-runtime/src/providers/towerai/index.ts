@@ -1,8 +1,10 @@
+import { readFileSync, writeFileSync } from 'node:fs';
 import { ModelProvider } from 'model-bank';
 import OpenAI from 'openai';
 
 import type { OpenAICompatibleFactoryOptions } from '../../core/openaiCompatibleFactory';
 import { createOpenAICompatibleRuntime } from '../../core/openaiCompatibleFactory';
+import { refreshTowerAITokens } from './auth';
 
 export const TOWERAI_DEFAULT_BASE_URL = 'https://tower-ai.yottastudios.com';
 
@@ -19,6 +21,64 @@ export function resolveTowerAIEndpoint(baseUrl: string, model: string): string {
 
 function isNewApiModel(model: string): boolean {
   return model.startsWith('deepseek');
+}
+
+// Module-scope token state. Initialized from process.env on first read; mutated
+// by the refresh flow so subsequent requests in the same process pick up the new
+// values without restart.
+let currentToken: string | undefined;
+let currentAuthToken: string | undefined;
+
+function getCurrentToken(): string {
+  if (currentToken === undefined) currentToken = process.env.TOWERAI_API_KEY ?? '';
+  return currentToken;
+}
+
+function getCurrentAuthToken(): string {
+  if (currentAuthToken === undefined) currentAuthToken = process.env.TOWERAI_AUTH_TOKEN ?? '';
+  return currentAuthToken;
+}
+
+// TowerAI returns this exact shape when the user's session/token has expired and
+// the openai upstream credential lookup fails. Also matches the documented
+// 600015 expiry sentinel (vertexai surfaces this differently).
+function isTokenExpiryError(status: number, body: string): boolean {
+  if (body.includes('600015') || body.includes('token过期')) return true;
+  if (
+    status === 500 &&
+    body.includes('"errorType":500') &&
+    body.includes('"provider":"openai"') &&
+    body.includes('"error":{}')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// Best-effort: rewrite TOWERAI_API_KEY / TOWERAI_AUTH_TOKEN lines in .env at the
+// repo root so the new tokens survive a server restart. Silent on failure.
+function persistTokensToEnv(token: string, authToken: string) {
+  const envPath = process.env.TOWERAI_ENV_FILE || '.env';
+  let content: string;
+  try {
+    content = readFileSync(envPath, 'utf8');
+  } catch {
+    return;
+  }
+  const replace = (src: string, key: string, value: string) => {
+    const re = new RegExp(`^${key}=.*$`, 'm');
+    return re.test(src) ? src.replace(re, `${key}=${value}`) : `${src}\n${key}=${value}`;
+  };
+  let next = replace(content, 'TOWERAI_API_KEY', token);
+  next = replace(next, 'TOWERAI_AUTH_TOKEN', authToken);
+  if (next !== content) {
+    try {
+      writeFileSync(envPath, next, 'utf8');
+      console.info(`[TowerAI] persisted refreshed tokens to ${envPath}`);
+    } catch (e) {
+      console.warn(`[TowerAI] failed to persist tokens to ${envPath}:`, (e as Error).message);
+    }
+  }
 }
 
 // Convert Tower AI SSE (event: text/stop/tool_calls) → OpenAI SSE (data: {...})
@@ -189,16 +249,19 @@ export const params = {
   },
   customClient: {
     createClient: (options) => {
-      const token = process.env.TOWERAI_API_KEY || options.apiKey || '';
-      const authToken = process.env.TOWERAI_AUTH_TOKEN || '';
+      // Seed module-scope state from options on first call (allows per-call apiKey override).
+      if (!currentToken && options.apiKey) currentToken = options.apiKey;
+      const autoRefresh = process.env.TOWERAI_AUTO_REFRESH === '1';
       const debug = process.env.DEBUG_TOWERAI_CHAT_COMPLETION === '1';
 
       if (debug) {
         console.info(
-          '[TowerAI] env check — token:',
-          token ? 'set' : 'MISSING',
+          '[TowerAI] env — token:',
+          getCurrentToken() ? 'set' : 'MISSING',
           '| authToken:',
-          authToken ? 'set' : 'MISSING',
+          getCurrentAuthToken() ? 'set' : 'MISSING',
+          '| autoRefresh:',
+          autoRefresh,
         );
       }
 
@@ -219,26 +282,6 @@ export const params = {
         const isVertexai = model.startsWith('gemini') || model.startsWith('claude');
         const isNewApi = isNewApiModel(model);
 
-        // Match the official TowerAI SDK shape exactly (E:\workspace\GitRepository\TowerAI\src\client.ts).
-        // No Authorization header, no Cookie, no x-lobe-trace.
-        // X-lobe-chat-auth is always sent (empty string when not set).
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-          'Token': token,
-          'X-lobe-chat-auth': authToken ?? '',
-          'accept': callerWantsStream ? 'text/event-stream' : 'application/json',
-        };
-
-        if (debug) {
-          console.info('[TowerAI] → POST', endpoint, 'model:', model);
-          console.info(
-            '[TowerAI]   Token:',
-            token.slice(0, 12),
-            '...  x-lobe-chat-auth:',
-            authToken ? authToken.slice(0, 12) + '...' : '(none)',
-          );
-        }
-
         // Match the official TowerAI SDK body shape. Sampler defaults are required;
         // omitting them causes the server to surface an empty error: {}.
         const towerBody: Record<string, unknown> = {
@@ -257,17 +300,37 @@ export const params = {
         if (body.useModelBuiltinSearch != null && isVertexai) {
           towerBody.useModelBuiltinSearch = body.useModelBuiltinSearch;
         }
-        // Only vertexai endpoint accepts native tools (FC models only — see handlePayload).
         if (isVertexai && body.tools) {
           towerBody.tools = body.tools;
           if (body.tool_choice != null) towerBody.tool_choice = body.tool_choice;
         }
+        const serializedBody = JSON.stringify(towerBody);
 
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(towerBody),
-        });
+        // Inner request — runs the actual fetch with the *current* token state so
+        // the refresh-and-retry path can re-invoke it after updating module state.
+        // Match the official TowerAI SDK header shape (no Authorization / Cookie / x-lobe-trace).
+        const doFetch = async () => {
+          const tk = getCurrentToken();
+          const at = getCurrentAuthToken();
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'Token': tk,
+            'X-lobe-chat-auth': at ?? '',
+            'accept': callerWantsStream ? 'text/event-stream' : 'application/json',
+          };
+          if (debug) {
+            console.info('[TowerAI] → POST', endpoint, 'model:', model);
+            console.info(
+              '[TowerAI]   Token:',
+              tk.slice(0, 12),
+              '...  x-lobe-chat-auth:',
+              at ? at.slice(0, 12) + '...' : '(none)',
+            );
+          }
+          return fetch(endpoint, { body: serializedBody, headers, method: 'POST' });
+        };
+
+        let res = await doFetch();
 
         if (debug) {
           const preview = await res.clone().text();
@@ -278,7 +341,31 @@ export const params = {
         if (!res.ok || !res.body) {
           const errBody = await res.clone().text();
           console.error(`[TowerAI] ← ${res.status} ${endpoint} | ${errBody.slice(0, 500)}`);
-          return res;
+
+          // Detect token expiry and auto-refresh once via puppeteer if enabled.
+          if (autoRefresh && isTokenExpiryError(res.status, errBody)) {
+            try {
+              console.info('[TowerAI] token appears expired — attempting auto-refresh');
+              const fresh = await refreshTowerAITokens();
+              currentToken = fresh.token;
+              if (fresh.authToken) currentAuthToken = fresh.authToken;
+              persistTokensToEnv(currentToken, currentAuthToken ?? '');
+              res = await doFetch();
+              if (!res.ok || !res.body) {
+                const retryBody = await res.clone().text();
+                console.error(
+                  `[TowerAI] ← ${res.status} (after refresh) ${endpoint} | ${retryBody.slice(0, 500)}`,
+                );
+                return res;
+              }
+              // fall through to success-path handling below
+            } catch (e) {
+              console.error('[TowerAI] auto-refresh failed:', (e as Error).message);
+              return res;
+            }
+          } else {
+            return res;
+          }
         }
 
         const ct = res.headers.get('content-type') ?? '';
@@ -341,7 +428,7 @@ export const params = {
 
       return new OpenAI({
         ...options,
-        apiKey: token || 'tower-ai',
+        apiKey: getCurrentToken() || 'tower-ai',
         baseURL: `${TOWERAI_DEFAULT_BASE_URL}/zi/webapi/chat/openai`,
         defaultHeaders: {},
         fetch: customFetch,

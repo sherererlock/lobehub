@@ -42,5 +42,8 @@
   },
   "peerDependencies": {
     "zod": "^3.25.76"
+  },
+  "optionalDependencies": {
+    "puppeteer-core": "^24.20.0"
   }
 }

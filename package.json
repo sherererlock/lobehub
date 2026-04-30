@@ -385,6 +385,7 @@
     "plaiceholder": "^3.0.0",
     "polished": "^4.3.1",
     "posthog-js": "~1.278.0",
+    "puppeteer-core": "^24.42.0",
     "pure-rand": "^7.0.1",
     "pwa-install-handler": "^2.6.3",
     "query-string": "^9.3.1",
