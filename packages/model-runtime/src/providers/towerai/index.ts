@@ -227,7 +227,9 @@ export const params = {
   baseURL: `${TOWERAI_DEFAULT_BASE_URL}/zi/webapi/chat/openai`,
   chatCompletion: {
     handlePayload: (payload) => {
-      const { tools, tool_choice, ...rest } = payload as any;
+      // Strip apiMode so responsesAPIModels (e.g. gpt-5.4) don't get forced into
+      // Responses API — TowerAI only supports Chat Completions upstream.
+      const { tools, tool_choice, apiMode, ...rest } = payload as any;
 
       const model = (rest.model as string) ?? '';
       const isVertexai = model.startsWith('gemini') || model.startsWith('claude');
