@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+
 import { ModelProvider } from 'model-bank';
 import OpenAI from 'openai';
 
@@ -222,6 +223,7 @@ function sanitizeToolsForVertexAI(tools: unknown[]): unknown[] {
 }
 
 export const params = {
+  apiKey: 'tower-ai',
   baseURL: `${TOWERAI_DEFAULT_BASE_URL}/zi/webapi/chat/openai`,
   chatCompletion: {
     handlePayload: (payload) => {
@@ -254,6 +256,23 @@ export const params = {
       const autoRefresh = process.env.TOWERAI_AUTO_REFRESH === '1';
       const debug = process.env.DEBUG_TOWERAI_CHAT_COMPLETION === '1';
 
+      // If auto-refresh is enabled and no real token exists, proactively fetch one on first request.
+      let initPromise: Promise<void> | null = null;
+      const hasRealToken = getCurrentToken() && getCurrentToken() !== 'tower-ai';
+      if (autoRefresh && !hasRealToken) {
+        initPromise = (async () => {
+          try {
+            console.info('[TowerAI] no token found — proactively refreshing via puppeteer');
+            const fresh = await refreshTowerAITokens();
+            currentToken = fresh.token;
+            if (fresh.authToken) currentAuthToken = fresh.authToken;
+            persistTokensToEnv(currentToken, currentAuthToken ?? '');
+          } catch (e) {
+            console.error('[TowerAI] proactive refresh failed:', (e as Error).message);
+          }
+        })();
+      }
+
       if (debug) {
         console.info(
           '[TowerAI] env — token:',
@@ -273,6 +292,12 @@ export const params = {
               ? input.href
               : (input as Request).url;
 
+        // Wait for proactive token refresh to complete before making any request.
+        if (initPromise) {
+          await initPromise;
+          initPromise = null;
+        }
+
         if (!url.includes('/chat/completions')) return fetch(input, init);
 
         const body = init?.body ? JSON.parse(init.body as string) : {};
@@ -288,10 +313,10 @@ export const params = {
           model,
           messages: body.messages,
           stream: true,
-          temperature:       body.temperature       ?? 1,
-          top_p:             body.top_p             ?? 0,
+          temperature: body.temperature ?? 1,
+          top_p: body.top_p ?? 0,
           frequency_penalty: body.frequency_penalty ?? 0,
-          presence_penalty:  body.presence_penalty  ?? 0,
+          presence_penalty: body.presence_penalty ?? 0,
         };
         if (body.max_tokens != null) towerBody.max_tokens = body.max_tokens;
         if (isNewApi) towerBody.apiMode = 'chatCompletion';
@@ -340,10 +365,14 @@ export const params = {
 
         if (!res.ok || !res.body) {
           const errBody = await res.clone().text();
-          console.error(`[TowerAI] ← ${res.status} ${endpoint} | ${errBody.slice(0, 500)}`);
 
           // Detect token expiry and auto-refresh once via puppeteer if enabled.
-          if (autoRefresh && isTokenExpiryError(res.status, errBody)) {
+          // Treat any non-200 as a potential token issue — the refresh is idempotent
+          // (cooldown-protected) and a successful retry is cheaper than a missed refresh.
+          if (
+            autoRefresh &&
+            (isTokenExpiryError(res.status, errBody) || res.status === 401 || res.status === 403)
+          ) {
             try {
               console.info('[TowerAI] token appears expired — attempting auto-refresh');
               const fresh = await refreshTowerAITokens();
@@ -368,20 +397,43 @@ export const params = {
           }
         }
 
-        const ct = res.headers.get('content-type') ?? '';
-        if (!ct.includes('text/event-stream') && !ct.includes('text/plain')) {
-          return res;
-        }
-
-        // Tower AI sometimes returns HTTP 200 with a JSON error body. Surface it as 502.
+        // Tower AI sometimes returns HTTP 200 with a JSON error body (e.g. token expired).
+        // Check for token expiry BEFORE surfacing as 502, so auto-refresh can retry.
         const cloned = res.clone();
         const peek = await cloned.text();
         if (peek.trimStart().startsWith('{')) {
-          console.error(`[TowerAI] ← 200/json-error ${endpoint} | ${peek.slice(0, 500)}`);
-          return new Response(peek, {
-            status: 502,
-            headers: { 'content-type': 'application/json' },
-          });
+          if (autoRefresh && isTokenExpiryError(res.status, peek)) {
+            try {
+              console.info('[TowerAI] token expired (200/json) — attempting auto-refresh');
+              const fresh = await refreshTowerAITokens();
+              currentToken = fresh.token;
+              if (fresh.authToken) currentAuthToken = fresh.authToken;
+              persistTokensToEnv(currentToken, currentAuthToken ?? '');
+              res = await doFetch();
+              // Re-read the new response
+              const retryCloned = res.clone();
+              const retryPeek = await retryCloned.text();
+              // If still an error after refresh, surface it
+              if (!res.ok || retryPeek.trimStart().startsWith('{')) {
+                return new Response(retryPeek, {
+                  status: res.ok ? 502 : res.status,
+                  headers: { 'content-type': 'application/json' },
+                });
+              }
+              // Fall through to success-path stream handling below
+            } catch (e) {
+              console.error('[TowerAI] auto-refresh failed:', (e as Error).message);
+              return new Response(peek, {
+                status: 502,
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+          } else {
+            return new Response(peek, {
+              status: 502,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
         }
 
         if (callerWantsStream) {

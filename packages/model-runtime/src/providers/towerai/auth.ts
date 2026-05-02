@@ -8,13 +8,14 @@
  * Strategy:
  * 1. Launch Chrome (preferring the user's existing profile via userDataDir so the
  *    auth.js cookie is reused — usually no OA login is required).
- * 2. Navigate to ${baseUrl}/chat. If redirected to OA SSO, fill credentials.
+ * 2. Navigate to ${baseUrl}/chat. If redirected to OA SSO or /next-auth/signin,
+ *    fill credentials via the appropriate login flow.
  * 3. Read `Token` from `localStorage.getItem('token')`.
  * 4. Capture `X-lobe-chat-auth` from outgoing requests via CDP Network domain
  *    (the value is computed client-side and cannot be derived from Token alone).
  */
 import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
+import path from 'node:path';
 
 export interface TowerAITokens {
   authToken: string;
@@ -73,14 +74,14 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
   const userDataDir =
     options.userDataDir ??
     process.env.TOWERAI_CHROME_PROFILE ??
-    join(homedir(), '.tower-ai-chrome');
+    path.join(homedir(), '.tower-ai-chrome');
   const oaUsername = options.oaUsername ?? process.env.TOWERAI_OA_USERNAME;
   const oaPassword = options.oaPassword ?? process.env.TOWERAI_OA_PASSWORD;
   const headless = options.headless ?? !!(oaUsername && oaPassword);
 
-  let puppeteer: typeof import('puppeteer-core');
+  let puppeteer: any;
   try {
-    puppeteer = (await import('puppeteer-core' as string)) as typeof import('puppeteer-core');
+    puppeteer = await import('puppeteer-core' as string);
   } catch {
     throw new Error(
       '[TowerAI] auto-refresh requires puppeteer-core. Install it: pnpm add -w puppeteer-core',
@@ -101,36 +102,54 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
     await cdp.send('Network.enable');
     let captured = '';
     cdp.on('Network.requestWillBeSent', (params: any) => {
-      const v = params.request.headers['X-lobe-chat-auth'] || params.request.headers['x-lobe-chat-auth'];
+      const v =
+        params.request.headers['X-lobe-chat-auth'] || params.request.headers['x-lobe-chat-auth'];
       if (typeof v === 'string' && v.length > 4) captured = v;
     });
 
     await page.goto(`${baseUrl}/chat`, { timeout: 30_000, waitUntil: 'networkidle2' });
 
-    // If we landed on OA SSO and have credentials, log in.
-    if (page.url().includes('oa.xinyoudi.com') && oaUsername && oaPassword) {
+    // Handle various login scenarios
+    const currentUrl = page.url();
+
+    // Case 1: OA SSO redirect
+    if (currentUrl.includes('oa.xinyoudi.com') && oaUsername && oaPassword) {
       await loginOA(page, oaUsername, oaPassword, baseUrl, timeoutMs);
-    } else if (!page.url().startsWith(baseUrl)) {
+    }
+    // Case 2: TowerAI's own /next-auth/signin page
+    else if (currentUrl.includes('/next-auth/signin') || currentUrl.includes('/signin')) {
+      if (oaUsername && oaPassword) {
+        await loginNextAuth(page, oaUsername, oaPassword, baseUrl, timeoutMs);
+      } else {
+        throw new Error(
+          `[TowerAI] on signin page but no OA credentials. Set TOWERAI_OA_USERNAME / TOWERAI_OA_PASSWORD.`,
+        );
+      }
+    }
+    // Case 3: Not on TowerAI at all (some other redirect)
+    else if (!currentUrl.startsWith(baseUrl)) {
       throw new Error(
-        `[TowerAI] not logged in and no OA credentials. Set TOWERAI_OA_USERNAME / TOWERAI_OA_PASSWORD, or run with TOWERAI_AUTO_REFRESH=1 in headed mode once to log in manually. Stuck at: ${page.url()}`,
+        `[TowerAI] unexpected redirect. Set TOWERAI_OA_USERNAME / TOWERAI_OA_PASSWORD, or run with TOWERAI_AUTO_REFRESH=1 in headed mode once to log in manually. Stuck at: ${currentUrl}`,
       );
     }
 
-    // Wait briefly for the app to fire its initial chat-related requests so CDP
-    // can observe X-lobe-chat-auth.
-    await new Promise((r) => setTimeout(r, 3000));
+    // Wait for the app to initialize and fire API requests.
+    await new Promise((r) => setTimeout(r, 5000));
 
     const token = (await page.evaluate(() => localStorage.getItem('token') ?? '')) as string;
     if (!token) {
       throw new Error(`[TowerAI] failed to read token from localStorage. URL: ${page.url()}`);
     }
+
+    // If CDP didn't capture X-lobe-chat-auth, try reloading
     if (!captured) {
-      // Some pages don't fire requests on idle; try to nudge by reloading once.
       await page.reload({ waitUntil: 'networkidle2', timeout: 15_000 }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 3000));
+      await new Promise((r) => setTimeout(r, 5000));
     }
 
-    console.info('[TowerAI] token refresh succeeded');
+    console.info(
+      `[TowerAI] token refresh succeeded (token=${token.length} chars, authToken=${captured.length} chars)`,
+    );
     return { authToken: captured, token };
   } finally {
     await browser.close().catch(() => {});
@@ -163,4 +182,66 @@ async function loginOA(
     { timeout: timeoutMs },
     baseUrl,
   );
+}
+
+/**
+ * Handle NextAuth /signin page. Looks for an OA SSO provider button or a credentials form.
+ */
+async function loginNextAuth(
+  page: any,
+  username: string,
+  password: string,
+  baseUrl: string,
+  timeoutMs: number,
+) {
+  console.info('[TowerAI] NextAuth signin page detected, attempting login');
+
+  // Try to find and click an OA/SSO provider button
+  const allButtons = await page.$$('button, a');
+  for (const b of allButtons) {
+    const text =
+      ((await page.evaluate((el: HTMLElement) => el.textContent?.trim(), b)) as string) || '';
+    const lower = text.toLowerCase();
+    if (
+      lower.includes('oa') ||
+      lower.includes('sso') ||
+      lower.includes('xin') ||
+      lower.includes('xinyoudi')
+    ) {
+      await b.click();
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15_000 }).catch(() => {});
+      break;
+    }
+  }
+
+  // Check if we're now on OA SSO
+  if (page.url().includes('oa.xinyoudi.com') && username && password) {
+    await loginOA(page, username, password, baseUrl, timeoutMs);
+    return;
+  }
+
+  // Check if there's a credentials form on the signin page
+  const emailInput = await page.$(
+    'input[name="email"], input[name="username"], input[type="email"]',
+  );
+  const passwordInput = await page.$('input[name="password"], input[type="password"]');
+  if (emailInput && passwordInput && username && password) {
+    const u = username.includes('@') ? username.split('@')[0] : username;
+    await emailInput.type(u, { delay: 30 });
+    await passwordInput.type(password, { delay: 30 });
+    await new Promise((r) => setTimeout(r, 500));
+    const submitBtn = await page.$('button[type="submit"]');
+    if (submitBtn) await submitBtn.click();
+    else {
+      const btns = await page.$$('button');
+      for (const btn of btns) {
+        const t = (await page.evaluate((el: HTMLElement) => el.textContent?.trim(), btn)) as string;
+        if (t && (t.includes('登录') || t.includes('Sign') || t.includes('Login'))) {
+          await btn.click();
+          break;
+        }
+      }
+    }
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: timeoutMs }).catch(() => {});
+  }
 }
