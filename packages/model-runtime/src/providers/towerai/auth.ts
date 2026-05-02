@@ -15,7 +15,7 @@
  *    (the value is computed client-side and cannot be derived from Token alone).
  */
 import { homedir, platform } from 'node:os';
-import path from 'node:path';
+import { join } from 'node:path';
 
 export interface TowerAITokens {
   authToken: string;
@@ -74,7 +74,7 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
   const userDataDir =
     options.userDataDir ??
     process.env.TOWERAI_CHROME_PROFILE ??
-    path.join(homedir(), '.tower-ai-chrome');
+    join(homedir(), '.tower-ai-chrome');
   const oaUsername = options.oaUsername ?? process.env.TOWERAI_OA_USERNAME;
   const oaPassword = options.oaPassword ?? process.env.TOWERAI_OA_PASSWORD;
   const headless = options.headless ?? !!(oaUsername && oaPassword);
