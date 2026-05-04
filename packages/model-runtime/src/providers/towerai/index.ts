@@ -9,21 +9,6 @@ import { refreshTowerAITokens } from './auth';
 
 export const TOWERAI_DEFAULT_BASE_URL = 'https://tower-ai.yottastudios.com';
 
-export function resolveTowerAIEndpoint(baseUrl: string, model: string): string {
-  const base = baseUrl.replace(/\/$/, '');
-  if (model.startsWith('gemini') || model.startsWith('claude')) {
-    return `${base}/zi/webapi/chat/vertexai`;
-  }
-  if (model.startsWith('deepseek')) {
-    return `${base}/zi/webapi/chat/newapi`;
-  }
-  return `${base}/zi/webapi/chat/openai`;
-}
-
-function isNewApiModel(model: string): boolean {
-  return model.startsWith('deepseek');
-}
-
 // Module-scope token state. Initialized from process.env on first read; mutated
 // by the refresh flow so subsequent requests in the same process pick up the new
 // values without restart.
@@ -42,15 +27,11 @@ function getCurrentAuthToken(): string {
 
 // TowerAI returns this exact shape when the user's session/token has expired and
 // the openai upstream credential lookup fails. Also matches the documented
-// 600015 expiry sentinel (vertexai surfaces this differently).
+// 600015 expiry sentinel. 471 is a custom TowerAI auth-rejection status code.
 function isTokenExpiryError(status: number, body: string): boolean {
+  if (status === 471) return true;
   if (body.includes('600015') || body.includes('token过期')) return true;
-  if (
-    status === 500 &&
-    body.includes('"errorType":500') &&
-    body.includes('"provider":"openai"') &&
-    body.includes('"error":{}')
-  ) {
+  if (status === 500 && body.includes('"errorType":500') && body.includes('"error":{}')) {
     return true;
   }
   return false;
@@ -82,7 +63,63 @@ function persistTokensToEnv(token: string, authToken: string) {
   }
 }
 
-// Convert Tower AI SSE (event: text/stop/tool_calls) → OpenAI SSE (data: {...})
+// JSON Schema fields that Vertex AI does not support in function declarations.
+// The zetta_ai endpoint routes gemini/claude models through Vertex AI, so these
+// must be stripped from tool definitions before sending.
+const VERTEXAI_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  'const',
+  '$schema',
+  '$id',
+  '$ref',
+  'definitions',
+  '$defs',
+  'examples',
+  'default',
+  'oneOf',
+  'anyOf',
+  'allOf',
+]);
+
+function sanitizeSchemaForVertexAI(value: unknown, depth = 0): unknown {
+  if (!value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((v) => sanitizeSchemaForVertexAI(v, depth + 1));
+
+  const obj = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (VERTEXAI_UNSUPPORTED_SCHEMA_KEYS.has(k)) continue;
+    if (k === 'type') {
+      // Vertex AI rejects array types (e.g. ["string", "null"]) — collapse to first non-null value
+      if (Array.isArray(v)) {
+        const picked = (v as unknown[]).find((t) => t !== 'null') ?? v[0];
+        if (picked != null) result[k] = picked;
+        continue;
+      }
+      // Vertex AI rejects "type" at deep nesting when "properties"/"items" coexist.
+      // Preserve it at shallow depth (0–1) where Vertex AI requires it (e.g. parameters schema).
+      if (depth > 1 && (obj.properties || obj.items)) continue;
+    }
+    result[k] = sanitizeSchemaForVertexAI(v, depth + 1);
+  }
+  // Vertex AI requires every schema object to have a "type" field — infer if missing
+  if (result.properties && !result.type) result.type = 'object';
+  if (result.items && !result.type) result.type = 'array';
+  return result;
+}
+
+function sanitizeToolsForVertexAI(tools: unknown[]): unknown[] {
+  return tools.map((tool) => {
+    if (!tool || typeof tool !== 'object') return tool;
+    const t = tool as any;
+    if (!t.function?.parameters) return tool;
+    return {
+      ...t,
+      function: { ...t.function, parameters: sanitizeSchemaForVertexAI(t.function.parameters) },
+    };
+  });
+}
+
+// Convert Tower AI SSE (event: text/stop/usage/tool_calls) → OpenAI SSE (data: {...})
 function toOpenAIStream(
   src: ReadableStream<Uint8Array>,
   model: string,
@@ -99,14 +136,16 @@ function toOpenAIStream(
     ctrl: ReadableStreamDefaultController<Uint8Array>,
     content: string,
     finishReason: string | null,
+    usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number },
   ) {
-    const chunk = {
+    const chunk: Record<string, unknown> = {
       id,
       object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
       model,
       choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
     };
+    if (usage) chunk.usage = usage;
     ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
   }
 
@@ -146,12 +185,25 @@ function toOpenAIStream(
         content = data;
       }
       emitChunk(ctrl, content, null);
+    } else if (eventType === 'usage' && data) {
+      try {
+        const raw = JSON.parse(data);
+        const usage = {
+          prompt_tokens: raw.inputTextTokens ?? raw.totalInputTokens ?? 0,
+          completion_tokens: raw.outputTextTokens ?? raw.totalOutputTokens ?? 0,
+          total_tokens: raw.totalTokens ?? 0,
+        };
+        emitChunk(ctrl, '', null, usage);
+      } catch {
+        // skip malformed usage
+      }
     } else if (eventType === 'stop') {
       emitChunk(ctrl, '', hadToolCalls ? 'tool_calls' : 'stop');
       ctrl.enqueue(encoder.encode('data: [DONE]\n\n'));
       ctrl.close();
       return true;
     }
+    // event: speed is informational, skip
     return false;
   }
 
@@ -177,78 +229,17 @@ function toOpenAIStream(
   });
 }
 
-// Vertexai-endpoint models that support native function calling.
-// Corresponds to abilities.functionCall: true in the towerai model bank.
-const VERTEXAI_FUNCTION_CALL_MODELS = new Set([
-  'gemini-3-flash-preview',
-  'gemini-3.1-pro-preview',
-  'claude-sonnet-4-6',
-  'claude-sonnet-4-5-20250929',
-]);
-
-// JSON Schema fields that Vertex AI does not support in function declarations.
-const VERTEXAI_UNSUPPORTED_SCHEMA_KEYS = new Set([
-  'const',
-  '$schema',
-  '$id',
-  '$ref',
-  'definitions',
-  '$defs',
-  'examples',
-  'default',
-]);
-
-function sanitizeSchemaForVertexAI(value: unknown): unknown {
-  if (!value || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(sanitizeSchemaForVertexAI);
-
-  const result: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (VERTEXAI_UNSUPPORTED_SCHEMA_KEYS.has(k)) continue;
-    result[k] = sanitizeSchemaForVertexAI(v);
-  }
-  return result;
-}
-
-function sanitizeToolsForVertexAI(tools: unknown[]): unknown[] {
-  return tools.map((tool) => {
-    if (!tool || typeof tool !== 'object') return tool;
-    const t = tool as any;
-    if (!t.function?.parameters) return tool;
-    return {
-      ...t,
-      function: { ...t.function, parameters: sanitizeSchemaForVertexAI(t.function.parameters) },
-    };
-  });
-}
+const TOWERAI_CHAT_ENDPOINT = '/zi/webapi/chat/zetta_ai';
 
 export const params = {
   apiKey: 'tower-ai',
-  baseURL: `${TOWERAI_DEFAULT_BASE_URL}/zi/webapi/chat/openai`,
+  baseURL: `${TOWERAI_DEFAULT_BASE_URL}${TOWERAI_CHAT_ENDPOINT}`,
   chatCompletion: {
     handlePayload: (payload) => {
-      // Strip apiMode so responsesAPIModels (e.g. gpt-5.4) don't get forced into
-      // Responses API — TowerAI only supports Chat Completions upstream.
-      const { tools, tool_choice, apiMode, ...rest } = payload as any;
-
-      const model = (rest.model as string) ?? '';
-      const isVertexai = model.startsWith('gemini') || model.startsWith('claude');
-      const hasTools = Array.isArray(tools) && tools.length > 0;
-
-      // Preserve the caller's stream intent — customFetch uses it to decide whether to
-      // return SSE or a synthesized JSON response. Tower AI itself is always streamed.
-      if (hasTools && VERTEXAI_FUNCTION_CALL_MODELS.has(model)) {
-        return {
-          ...rest,
-          tool_choice,
-          tools: sanitizeToolsForVertexAI(tools),
-        } as any;
-      }
-
-      const searchParams =
-        hasTools && isVertexai ? { searchMode: 'smart', useModelBuiltinSearch: true } : {};
-
-      return { ...rest, ...searchParams } as any;
+      // Strip apiMode so responsesAPIModels don't get forced into Responses API
+      // — TowerAI only supports Chat Completions upstream.
+      const { apiMode, ...rest } = payload as any;
+      return rest as any;
     },
   },
   customClient: {
@@ -305,37 +296,30 @@ export const params = {
         const body = init?.body ? JSON.parse(init.body as string) : {};
         const model = (body?.model as string) || '';
         const callerWantsStream = (body?.stream as boolean) ?? false;
-        const endpoint = resolveTowerAIEndpoint(TOWERAI_DEFAULT_BASE_URL, model);
-        const isVertexai = model.startsWith('gemini') || model.startsWith('claude');
-        const isNewApi = isNewApiModel(model);
+        const endpoint = `${TOWERAI_DEFAULT_BASE_URL}${TOWERAI_CHAT_ENDPOINT}`;
 
         // Match the official TowerAI SDK body shape. Sampler defaults are required;
         // omitting them causes the server to surface an empty error: {}.
         const towerBody: Record<string, unknown> = {
           model,
           messages: body.messages,
-          stream: true,
+          stream: callerWantsStream,
           temperature: body.temperature ?? 1,
-          top_p: body.top_p ?? 0,
+          top_p: body.top_p ?? 1,
           frequency_penalty: body.frequency_penalty ?? 0,
           presence_penalty: body.presence_penalty ?? 0,
         };
         if (body.max_tokens != null) towerBody.max_tokens = body.max_tokens;
-        if (isNewApi) towerBody.apiMode = 'chatCompletion';
-        if (body.enabledSearch != null && !isNewApi) towerBody.enabledSearch = body.enabledSearch;
-        if (body.searchMode != null && isVertexai) towerBody.searchMode = body.searchMode;
-        if (body.useModelBuiltinSearch != null && isVertexai) {
-          towerBody.useModelBuiltinSearch = body.useModelBuiltinSearch;
-        }
-        if (isVertexai && body.tools) {
-          towerBody.tools = body.tools;
+        if (body.enabledSearch != null) towerBody.enabledSearch = body.enabledSearch;
+        if (Array.isArray(body.tools) && body.tools.length > 0) {
+          towerBody.tools = sanitizeToolsForVertexAI(body.tools);
           if (body.tool_choice != null) towerBody.tool_choice = body.tool_choice;
         }
         const serializedBody = JSON.stringify(towerBody);
 
         // Inner request — runs the actual fetch with the *current* token state so
         // the refresh-and-retry path can re-invoke it after updating module state.
-        // Match the official TowerAI SDK header shape (no Authorization / Cookie / x-lobe-trace).
+        // Match the official TowerAI SDK header shape.
         const doFetch = async () => {
           const tk = getCurrentToken();
           const at = getCurrentAuthToken();
@@ -343,6 +327,13 @@ export const params = {
             'Content-Type': 'application/json',
             'Token': tk,
             'X-lobe-chat-auth': at ?? '',
+            'x-lobe-trace': Buffer.from(
+              JSON.stringify({
+                traceName: 'Chat Completion',
+                enabled: true,
+                tags: ['Chat Completion'],
+              }),
+            ).toString('base64'),
             'accept': callerWantsStream ? 'text/event-stream' : 'application/json',
           };
           if (debug) {
@@ -438,7 +429,7 @@ export const params = {
           }
         }
 
-        if (callerWantsStream) {
+        if (callerWantsStream && res.body) {
           return new Response(toOpenAIStream(res.body, model), {
             status: 200,
             headers: { 'content-type': 'text/event-stream' },
@@ -483,7 +474,7 @@ export const params = {
       return new OpenAI({
         ...options,
         apiKey: getCurrentToken() || 'tower-ai',
-        baseURL: `${TOWERAI_DEFAULT_BASE_URL}/zi/webapi/chat/openai`,
+        baseURL: `${TOWERAI_DEFAULT_BASE_URL}${TOWERAI_CHAT_ENDPOINT}`,
         defaultHeaders: {},
         fetch: customFetch,
       });

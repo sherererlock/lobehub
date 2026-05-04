@@ -1,9 +1,14 @@
-import type { TowerAIAuthState, TowerAICredentials, TowerAILoginParams } from '@lobechat/electron-client-ipc';
+import type {
+  TowerAIAuthState,
+  TowerAICredentials,
+  TowerAILoginParams,
+} from '@lobechat/electron-client-ipc';
 
-import { resolveTowerAIEndpoint } from '@lobechat/model-runtime/providers/towerai';
 import { ensureElectronIpc } from '@/utils/electron/ipc';
 
 export type { TowerAIAuthState, TowerAICredentials };
+
+const TOWERAI_CHAT_ENDPOINT = '/zi/webapi/chat/zetta_ai';
 
 class TowerAIService {
   async getState(): Promise<TowerAIAuthState> {
@@ -32,17 +37,17 @@ class TowerAIService {
   }
 
   /**
-   * Get Tower AI credentials and resolve the correct endpoint for the given model.
+   * Get Tower AI credentials and resolve the endpoint for the zetta_ai unified API.
    * Call this before creating a Tower AI runtime instance.
    */
   async resolveRuntimeParams(
-    model: string,
+    _model: string,
     baseUrl = 'https://tower-ai.yottastudios.com',
   ): Promise<{ apiKey: string; baseURL: string }> {
     const { token } = await this.getToken();
     return {
       apiKey: token,
-      baseURL: resolveTowerAIEndpoint(baseUrl, model),
+      baseURL: `${baseUrl.replace(/\/$/, '')}${TOWERAI_CHAT_ENDPOINT}`,
     };
   }
 }

@@ -1,7 +1,7 @@
 /**
  * TowerAI token refresh via headless browser (puppeteer-core).
  *
- * Adapted from the official TowerAI SDK (E:\workspace\GitRepository\TowerAI\src\auth.ts).
+ * Synced with the official TowerAI SDK (E:\workspace\GitRepository\TowerAI\src\auth.ts).
  * Lazily imports puppeteer-core so the dependency is optional — only servers that
  * opt into auto-refresh (TOWERAI_AUTO_REFRESH=1) need the package + a Chrome binary.
  *
@@ -14,6 +14,7 @@
  * 4. Capture `X-lobe-chat-auth` from outgoing requests via CDP Network domain
  *    (the value is computed client-side and cannot be derived from Token alone).
  */
+import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,12 +29,28 @@ export interface RefreshOptions {
   headless?: boolean;
   oaPassword?: string;
   oaUsername?: string;
+  /** Directory to persist token state for the helper server */
+  persistToStateDir?: string;
   timeoutMs?: number;
   userDataDir?: string;
 }
 
+type TowerAIPageStage = 'app' | 'signin' | 'oa' | 'unknown';
+
 const DEFAULT_BASE_URL = 'https://tower-ai.yottastudios.com';
 const REFRESH_COOLDOWN_MS = 30_000;
+
+const OA_EMAIL_SELECTORS = [
+  'input[name="email"]',
+  'input[placeholder="企业邮箱"]',
+  'input[type="text"]',
+] as const;
+
+const OA_PASSWORD_SELECTORS = [
+  'input[name="password"]',
+  'input[placeholder="密码"]',
+  'input[type="password"]',
+] as const;
 
 const CHROME_PATHS: Record<string, string[]> = {
   darwin: ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'],
@@ -46,6 +63,153 @@ const CHROME_PATHS: Record<string, string[]> = {
 
 function findChrome(): string {
   return (CHROME_PATHS[platform()] ?? CHROME_PATHS.linux)[0];
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/$/, '');
+}
+
+export function classifyTowerAIPage(url: string, baseUrl: string): TowerAIPageStage {
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+  if (url.startsWith(`${normalizedBaseUrl}/chat`)) return 'app';
+  if (url.includes('oa.xinyoudi.com')) return 'oa';
+  if (url.startsWith(`${normalizedBaseUrl}/next-auth/signin`) || url.includes('/next-auth/signin'))
+    return 'signin';
+  if (url.startsWith(normalizedBaseUrl) && !url.includes('/next-auth/')) return 'app';
+  return 'unknown';
+}
+
+async function findFirstElement(page: any, selectors: readonly string[]) {
+  for (const selector of selectors) {
+    const element = await page.$(selector);
+    if (element) return element;
+  }
+  return null;
+}
+
+async function waitForUrlChange(page: any, currentUrl: string, timeoutMs: number) {
+  if (timeoutMs <= 0) return;
+  await page
+    .waitForFunction(
+      (prev: string) => window.location.href !== prev,
+      { timeout: timeoutMs },
+      currentUrl,
+    )
+    .catch(() => {});
+}
+
+function remainingTimeout(startedAt: number, totalTimeoutMs: number): number {
+  return Math.max(1_000, totalTimeoutMs - (Date.now() - startedAt));
+}
+
+/**
+ * Handle the OA SSO login page at oa.xinyoudi.com.
+ */
+async function handleOALogin(page: any, oaUsername: string, oaPassword: string): Promise<void> {
+  console.info('[TowerAI] Detected OA login page, filling credentials...');
+
+  await page.waitForFunction(
+    (selectors: readonly string[]) => selectors.some((s: string) => !!document.querySelector(s)),
+    { timeout: 15_000 },
+    OA_EMAIL_SELECTORS,
+  );
+
+  // The OA form appends "@yottastudios.com" — only type the username part
+  const username = oaUsername.includes('@') ? oaUsername.split('@')[0] : oaUsername;
+
+  const emailInput = await findFirstElement(page, OA_EMAIL_SELECTORS);
+  if (emailInput) {
+    await emailInput.click({ clickCount: 3 });
+    await page.keyboard.press('Backspace');
+    await emailInput.type(username, { delay: 30 });
+  }
+
+  const passwordInput = await findFirstElement(page, OA_PASSWORD_SELECTORS);
+  if (passwordInput) {
+    await passwordInput.click({ clickCount: 3 });
+    await page.keyboard.press('Backspace');
+    await passwordInput.type(oaPassword, { delay: 30 });
+  }
+
+  await new Promise((r) => setTimeout(r, 800));
+
+  // Click the "登录" button
+  const buttons = await page.$$('button');
+  for (const btn of buttons) {
+    const text = await page.evaluate((el: HTMLElement) => el.textContent?.trim(), btn);
+    if (text === '登录') {
+      await btn.click();
+      console.info('[TowerAI] Clicked 登录 button');
+      return;
+    }
+  }
+  console.warn('[TowerAI] 登录 button not found');
+}
+
+/**
+ * On the /next-auth/signin page, find and click the OA tab/button to initiate SSO.
+ */
+async function clickTowerAISignIn(page: any): Promise<boolean> {
+  await page.waitForSelector('button, .ant-btn, a', { timeout: 15_000 }).catch(() => {});
+
+  // Try ant-tabs first (the signin page may have an OA tab)
+  const tabs = await page.$$('.ant-tabs-tab');
+  for (const tab of tabs) {
+    const text = await page.evaluate((el: HTMLElement) => el.textContent?.trim() ?? '', tab);
+    if (text.includes('OA')) {
+      await tab.click();
+      break;
+    }
+  }
+
+  await new Promise((r) => setTimeout(r, 300));
+
+  const panelButton = await page.$('.ant-tabs-tabpane-active button, .ant-tabs-tabpane-active a');
+  if (panelButton) {
+    await panelButton.click();
+    console.info('[TowerAI] Clicked OA sign-in entry');
+    return true;
+  }
+
+  // Fallback: scan all interactive elements
+  const elements = await page.$$('button, a, div[role="button"], span');
+  for (const el of elements) {
+    const text = await page.evaluate((n: HTMLElement) => n.textContent?.trim() ?? '', el);
+    if (text.includes('OA登录') || text.includes('OA')) {
+      await el.click();
+      console.info('[TowerAI] Clicked OA sign-in entry');
+      return true;
+    }
+  }
+
+  console.warn('[TowerAI] OA sign-in entry not found on current page');
+  return false;
+}
+
+/**
+ * Persist token state to a JSON file for the helper server to read.
+ */
+async function persistToStateDir(
+  stateDir: string,
+  token: string,
+  authToken: string,
+  baseUrl: string,
+) {
+  const filePath = join(stateDir, 'state.json');
+  try {
+    await mkdir(stateDir, { recursive: true });
+    const data = {
+      authToken,
+      baseUrl,
+      lastRefresh: new Date().toISOString(),
+      source: 'browser',
+      token,
+    };
+    await writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+    console.info(`[TowerAI] persisted tokens to ${filePath}`);
+  } catch (e) {
+    console.warn(`[TowerAI] failed to persist tokens to ${filePath}:`, (e as Error).message);
+  }
 }
 
 let inflight: Promise<TowerAITokens> | null = null;
@@ -71,12 +235,16 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
   const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
   const timeoutMs = options.timeoutMs ?? 120_000;
   const chromePath = options.chromePath ?? process.env.TOWERAI_CHROME_PATH ?? findChrome();
+  // Support both TOWERAI_* (legacy) and TOWER_AI_* (SDK) env var names
   const userDataDir =
     options.userDataDir ??
     process.env.TOWERAI_CHROME_PROFILE ??
+    process.env.TOWER_AI_CHROME_PROFILE ??
     join(homedir(), '.tower-ai-chrome');
-  const oaUsername = options.oaUsername ?? process.env.TOWERAI_OA_USERNAME;
-  const oaPassword = options.oaPassword ?? process.env.TOWERAI_OA_PASSWORD;
+  const oaUsername =
+    options.oaUsername ?? process.env.TOWERAI_OA_USERNAME ?? process.env.TOWER_AI_OA_USERNAME;
+  const oaPassword =
+    options.oaPassword ?? process.env.TOWERAI_OA_PASSWORD ?? process.env.TOWER_AI_OA_PASSWORD;
   const headless = options.headless ?? !!(oaUsername && oaPassword);
 
   let puppeteer: any;
@@ -90,7 +258,13 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
 
   console.info(`[TowerAI] launching Chrome for token refresh (headless=${headless})`);
   const browser = await puppeteer.launch({
-    args: ['--no-first-run', '--no-default-browser-check', '--disable-gpu', '--disable-extensions'],
+    args: [
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--window-size=1280,900',
+    ],
     executablePath: chromePath,
     headless,
     userDataDir,
@@ -98,6 +272,8 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
 
   try {
     const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+
     const cdp = await page.createCDPSession();
     await cdp.send('Network.enable');
     let captured = '';
@@ -109,32 +285,64 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
 
     await page.goto(`${baseUrl}/chat`, { timeout: 30_000, waitUntil: 'networkidle2' });
 
-    // Handle various login scenarios
-    const currentUrl = page.url();
+    let url = page.url();
+    let stage = classifyTowerAIPage(url, baseUrl);
 
-    // Case 1: OA SSO redirect
-    if (currentUrl.includes('oa.xinyoudi.com') && oaUsername && oaPassword) {
-      await loginOA(page, oaUsername, oaPassword, baseUrl, timeoutMs);
-    }
-    // Case 2: TowerAI's own /next-auth/signin page
-    else if (currentUrl.includes('/next-auth/signin') || currentUrl.includes('/signin')) {
-      if (oaUsername && oaPassword) {
-        await loginNextAuth(page, oaUsername, oaPassword, baseUrl, timeoutMs);
-      } else {
-        throw new Error(
-          `[TowerAI] on signin page but no OA credentials. Set TOWERAI_OA_USERNAME / TOWERAI_OA_PASSWORD.`,
-        );
+    // Handle login if needed — loop-based flow matching the SDK
+    if (stage !== 'app') {
+      const startedAt = Date.now();
+      console.info(`[TowerAI] login required, current stage: ${stage}`);
+
+      while (stage !== 'app') {
+        if (Date.now() - startedAt > timeoutMs) {
+          throw new Error(`[TowerAI] timed out waiting for login flow. URL: ${page.url()}`);
+        }
+
+        url = page.url();
+        stage = classifyTowerAIPage(url, baseUrl);
+
+        if (stage === 'signin') {
+          console.info('[TowerAI] on next-auth sign-in page, initiating OA login...');
+          await clickTowerAISignIn(page);
+          await waitForUrlChange(
+            page,
+            url,
+            Math.min(5_000, remainingTimeout(startedAt, timeoutMs)),
+          );
+        } else if (stage === 'oa' && oaUsername && oaPassword) {
+          await handleOALogin(page, oaUsername, oaPassword);
+          console.info('[TowerAI] waiting for SSO redirect...');
+          await page.waitForFunction(
+            (base: string) => window.location.href.startsWith(base),
+            { timeout: remainingTimeout(startedAt, timeoutMs) },
+            normalizeBaseUrl(baseUrl),
+          );
+        } else if (stage === 'oa') {
+          console.info('[TowerAI] please log in manually in the browser window...');
+          await page.waitForFunction(
+            (base: string) => window.location.href.startsWith(base),
+            { timeout: remainingTimeout(startedAt, timeoutMs) },
+            normalizeBaseUrl(baseUrl),
+          );
+        } else {
+          await waitForUrlChange(
+            page,
+            url,
+            Math.min(5_000, remainingTimeout(startedAt, timeoutMs)),
+          );
+        }
+
+        await new Promise((r) => setTimeout(r, 800));
+        url = page.url();
+        stage = classifyTowerAIPage(url, baseUrl);
       }
-    }
-    // Case 3: Not on TowerAI at all (some other redirect)
-    else if (!currentUrl.startsWith(baseUrl)) {
-      throw new Error(
-        `[TowerAI] unexpected redirect. Set TOWERAI_OA_USERNAME / TOWERAI_OA_PASSWORD, or run with TOWERAI_AUTO_REFRESH=1 in headed mode once to log in manually. Stuck at: ${currentUrl}`,
-      );
-    }
 
-    // Wait for the app to initialize and fire API requests.
-    await new Promise((r) => setTimeout(r, 5000));
+      console.info('[TowerAI] login complete, waiting for app to initialize...');
+      await new Promise((r) => setTimeout(r, 5000));
+    } else {
+      console.info('[TowerAI] already logged in, waiting for requests...');
+      await new Promise((r) => setTimeout(r, 3000));
+    }
 
     const token = (await page.evaluate(() => localStorage.getItem('token') ?? '')) as string;
     if (!token) {
@@ -144,104 +352,21 @@ async function doRefresh(options: RefreshOptions): Promise<TowerAITokens> {
     // If CDP didn't capture X-lobe-chat-auth, try reloading
     if (!captured) {
       await page.reload({ waitUntil: 'networkidle2', timeout: 15_000 }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 3000));
     }
 
     console.info(
       `[TowerAI] token refresh succeeded (token=${token.length} chars, authToken=${captured.length} chars)`,
     );
+
+    // Persist to state dir if configured
+    const stateDir = options.persistToStateDir ?? process.env.TOWERAI_STATE_DIR;
+    if (stateDir) {
+      await persistToStateDir(stateDir, token, captured, baseUrl);
+    }
+
     return { authToken: captured, token };
   } finally {
     await browser.close().catch(() => {});
-  }
-}
-
-async function loginOA(
-  page: any,
-  username: string,
-  password: string,
-  baseUrl: string,
-  timeoutMs: number,
-) {
-  console.info('[TowerAI] OA login page detected, filling credentials');
-  await page.waitForSelector('input[name="email"], input[name="password"]', { timeout: 15_000 });
-  const u = username.includes('@') ? username.split('@')[0] : username;
-  await page.type('input[name="email"], input[type="text"]', u, { delay: 30 });
-  await page.type('input[name="password"], input[type="password"]', password, { delay: 30 });
-  await new Promise((r) => setTimeout(r, 500));
-  const buttons = await page.$$('button');
-  for (const b of buttons) {
-    const t = (await page.evaluate((el: HTMLElement) => el.textContent?.trim(), b)) as string;
-    if (t === '登录') {
-      await b.click();
-      break;
-    }
-  }
-  await page.waitForFunction(
-    (base: string) => window.location.href.startsWith(base),
-    { timeout: timeoutMs },
-    baseUrl,
-  );
-}
-
-/**
- * Handle NextAuth /signin page. Looks for an OA SSO provider button or a credentials form.
- */
-async function loginNextAuth(
-  page: any,
-  username: string,
-  password: string,
-  baseUrl: string,
-  timeoutMs: number,
-) {
-  console.info('[TowerAI] NextAuth signin page detected, attempting login');
-
-  // Try to find and click an OA/SSO provider button
-  const allButtons = await page.$$('button, a');
-  for (const b of allButtons) {
-    const text =
-      ((await page.evaluate((el: HTMLElement) => el.textContent?.trim(), b)) as string) || '';
-    const lower = text.toLowerCase();
-    if (
-      lower.includes('oa') ||
-      lower.includes('sso') ||
-      lower.includes('xin') ||
-      lower.includes('xinyoudi')
-    ) {
-      await b.click();
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15_000 }).catch(() => {});
-      break;
-    }
-  }
-
-  // Check if we're now on OA SSO
-  if (page.url().includes('oa.xinyoudi.com') && username && password) {
-    await loginOA(page, username, password, baseUrl, timeoutMs);
-    return;
-  }
-
-  // Check if there's a credentials form on the signin page
-  const emailInput = await page.$(
-    'input[name="email"], input[name="username"], input[type="email"]',
-  );
-  const passwordInput = await page.$('input[name="password"], input[type="password"]');
-  if (emailInput && passwordInput && username && password) {
-    const u = username.includes('@') ? username.split('@')[0] : username;
-    await emailInput.type(u, { delay: 30 });
-    await passwordInput.type(password, { delay: 30 });
-    await new Promise((r) => setTimeout(r, 500));
-    const submitBtn = await page.$('button[type="submit"]');
-    if (submitBtn) await submitBtn.click();
-    else {
-      const btns = await page.$$('button');
-      for (const btn of btns) {
-        const t = (await page.evaluate((el: HTMLElement) => el.textContent?.trim(), btn)) as string;
-        if (t && (t.includes('登录') || t.includes('Sign') || t.includes('Login'))) {
-          await btn.click();
-          break;
-        }
-      }
-    }
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: timeoutMs }).catch(() => {});
   }
 }
